@@ -561,6 +561,7 @@ function hostMsg(conn, m) {
     hostPump(); return;
   }
   const uid = conn.uid; if (!uid) return;
+  if (m.t === 'ack') { HOST.ack[uid] = Math.max(HOST.ack[uid] || 0, +m.seq || 0); return; }
   if (m.t === 'nick') { conn.nick = String(m.nick || '').slice(0, 24); const G = HOST.G; const s = Object.keys(G.seats).find((k) => G.seats[k].uid === uid); if (s) G.seats[s].nick = conn.nick; rebuildPeers(); commit(); return; }
   if (m.t === 'want') { if (applyWant(uid, m.want || null, conn.nick)) commit(); return; }
   if (m.t === 'act' && m.act) {
@@ -649,9 +650,25 @@ async function llm(user) {
    ===================================================================== */
 const HOST = { active: false, G: null, sec: null, queue: [], busy: false, pendingAt: 0, forceAI: false, lastWant: {}, seenAct: {} };
 const PACE = { short: 1700, mid: 2600, long: 3600 };
+HOST.ack = {};
+const spotMs = () => ((ST && ST.settings && ST.settings.spot) || 15) * 1000;
+async function waitAck() {
+  const G = HOST.G; if (!G || !G.game) return;
+  const seq = G.game.seq; const limit = ((G.settings.spot || 15) * 1000) + 800; const t0 = Date.now();
+  while (Date.now() - t0 < limit) {
+    const need = [...new Set([myUid(), ...Object.values(G.seats).map((s) => s.uid).filter(online)])];
+    if (need.every((u) => (HOST.ack[u] || 0) >= seq)) return;
+    await sleep(200);
+  }
+}
+function ackSeq(seq) {
+  if (!seq) return;
+  if (HOST.active) HOST.ack[myUid()] = Math.max(HOST.ack[myUid()] || 0, seq);
+  else if (NET.conn) send(NET.conn, { t: 'ack', seq });
+}
 
 function newLobby() {
-  return { v: 1, inst: Math.random().toString(36).slice(2, 9), phase: 'lobby', host: { uid: myUid() }, settings: { brain: AIK.key ? 'llm' : 'bots', timer: 0 }, seats: {}, game: null };
+  return { v: 1, inst: Math.random().toString(36).slice(2, 9), phase: 'lobby', host: { uid: myUid() }, settings: { brain: AIK.key ? 'llm' : 'bots', timer: 0, spot: 15 }, seats: {}, game: null };
 }
 async function becomeHost(existing) {
   HOST.active = true;
@@ -703,7 +720,8 @@ function startGame() {
     step: 'GRC_CHOOSE', cur: null, pending: null, pc: 0, events: [], seq: 0, records: [{ round: 1 }], outcome: null, reveal: null, x: '' };
   HOST.queue = []; HOST.seenAct = {};
   ev('start', {});
-  commit().then(() => pace(PACE.mid)).then(hostPump);
+  HOST.busy = true;   // hold the engine while the opening announcement is on screen
+  commit().then(waitAck).finally(() => { HOST.busy = false; hostPump(); });
 }
 function toLobby() { const G = HOST.G; G.phase = 'lobby'; G.game = null; HOST.sec = null; commit(); }
 
@@ -717,7 +735,7 @@ async function hostStep() {
   const G = HOST.G, g = G.game; if (G.phase !== 'play' || !g) return false;
   if (g.step === 'CLOCK') { await doClock(); return true; }
   if (g.step === 'DECLARE' && g.discovered) { g.step = 'CLOCK'; return true; }
-  if (g.step === 'DECLARE' && g.guessBlockedRound === g.round) { ev('blocked', {}, null, { team: 'grc', gm: true }); g.step = 'CLOCK'; await commit(); await pace(PACE.mid); return true; }
+  if (g.step === 'DECLARE' && g.guessBlockedRound === g.round) { ev('blocked', {}, null, { team: 'grc', gm: true }); g.step = 'CLOCK'; await commit(); await waitAck(); return true; }
   const team = STEP_TEAM[g.step]; const humans = humansOn(team);
   if (!g.pending || g.pending.step !== g.step) {
     g.pending = { id: `${g.id}.${g.round}.${g.step}.${++g.pc}`, step: g.step, team, human: humans.length > 0, timerMs: humans.length ? (G.settings.timer || 0) * 1000 : 0, sug: suggestion(g.step) };
@@ -748,7 +766,7 @@ function suggestion(step) {
 /* each step's resolution; returns true to keep the pump moving */
 async function applyAction(step, a, actor) {
   const G = HOST.G, g = G.game, r = risk();
-  const done = async (ms) => { g.pending = null; await commit(); await pace(ms); return true; };
+  const done = async () => { g.pending = null; await commit(); await waitAck(); return true; };
   if (step === 'GRC_CHOOSE') {
     const target = D.it.some((f) => f.id === a.target) ? a.target : 'IT-01'; const cat = D.q[a.cat] ? a.cat : 'QA';
     g.cur = { target, cat, qs: Engine.drawQuestions(cat, 3), ev: null };
@@ -815,7 +833,7 @@ async function doClock() {
   ev('clock', { before, after: g.clock }, null, { gm: true });
   g.round += 1; g.records.push({ round: g.round }); g.cur = null;
   g.step = g.discovered ? 'IT_POOL' : 'GRC_CHOOSE';
-  await commit(); await pace(PACE.mid);
+  await commit(); await waitAck();
 }
 
 /* ---------- AI seats: Claude (via the page's sample capability) with built-in bots as fallback ---------- */
@@ -928,25 +946,25 @@ function queueSpots() {
   if (!ST || !ST.game) return;
   const evs = ST.game.events || [];
   if (!UI.gameId || UI.gameId !== ST.game.id) { UI.gameId = ST.game.id; UI.seenSeq = evs.length && !HOST.active && evs[evs.length - 1].seq > 2 ? evs[evs.length - 1].seq : 0; }
-  for (const e of evs) if (e.seq > UI.seenSeq) { UI.seenSeq = e.seq; const sp = spotFor(e); if (sp) UI.spotQ.push(sp); }
+  for (const e of evs) if (e.seq > UI.seenSeq) { UI.seenSeq = e.seq; const sp = spotFor(e); if (sp) { sp.seq = e.seq; UI.spotQ.push(sp); } }
   playSpots();
 }
 async function playSpots() {
   if (UI.spotBusy) return; UI.spotBusy = true;
   while (UI.spotQ.length) {
-    const sp = UI.spotQ.shift(); const dur = reduced ? 900 : sp.short ? 1500 : sp.xtra ? 3300 : 2300;
+    const sp = UI.spotQ.shift(); const dur = sp.short ? Math.min(spotMs(), 6000) : spotMs();
     const el = $('#spot');
     el.innerHTML = `<div class="spot ${sp.cls}" role="status" aria-live="polite"><div class="in">
       <div class="who">${sp.who}</div><p class="big">${esc(sp.big)}</p>${sp.sub ? `<p class="sub">${esc(sp.sub)}</p>` : ''}
       ${sp.flow ? `<div class="xtra flow"><span>${sp.flow[0]}</span>${I('arrow-left')}<span>${sp.flow[1]}</span></div>` : ''}
       ${sp.xtra ? `<div class="xtra">${sp.xtra}</div>` : ''}
       ${sp.say ? `<p class="sub" style="font-style:normal;opacity:.7">"${esc(sp.say)}"</p>` : ''}</div>
-      <div class="prog" style="animation-duration:${dur}ms"></div><div class="skip">اضغط للتخطي</div></div>`;
+      <div class="prog" style="animation-duration:${dur}ms"></div><div class="skip">اضغط أي مكان لما تخلص قراءة</div></div>`;
     icons();
     await new Promise((res) => { const t = setTimeout(res, dur); el.firstElementChild.addEventListener('click', () => { clearTimeout(t); res(); }, { once: true }); });
-    el.innerHTML = '';
+    el.innerHTML = ''; ackSeq(sp.seq);
   }
-  UI.spotBusy = false;
+  UI.spotBusy = false; ackSeq(UI.seenSeq);
 }
 
 /* =====================================================================
@@ -1084,6 +1102,7 @@ function renderLobby(M) {
           ${AIK.provider === 'custom' ? `<div class="field"><label>Base URL</label><input class="input mono" id="aBase" dir="ltr" value="${esc(AIK.base)}" placeholder="http://localhost:11434/v1"></div>` : ''}
           <div class="field"><label>API Key</label><input class="input mono" id="aKey" dir="ltr" type="password" value="${esc(AIK.key)}" autocomplete="off"></div>
           <div class="bar" style="border:0;padding:0;margin-top:8px"><button class="btn btn-line" id="aTest">${I('plug')} تجربة</button><span class="note" id="aOut">المفتاح بيضل بمتصفحك بس.</span></div></div>` : ''}
+        <div class="field" style="margin-top:10px"><label>مدة عرض كل حركة على الشاشة</label><select class="select" id="sSpot">${[5, 10, 15, 20, 30].map((v) => `<option value="${v}" ${(ST.settings.spot || 15) === v ? 'selected' : ''}>${v} ثانية${v === 15 ? ' (افتراضي)' : ''}</option>`).join('')}</select><span class="note">اللعبة بتكمل أبكر إذا كل اللاعبين ضغطوا.</span></div>
         <div class="field" style="margin-top:10px"><label>مؤقت الدور للاعبين</label><select class="select" id="sTimer">${[[0, 'بدون'], [60, '60 ثانية ثم AI'], [120, '120 ثانية ثم AI']].map(([v, l]) => `<option value="${v}" ${ST.settings.timer === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
         <div class="bar"><span class="note">${humans} لاعب · ${12 - humans} AI</span><span class="sp"></span><button class="btn btn-primary" id="bStart">${I('play')} ابدأ اللعبة</button></div>
         <p class="note">خلي هالصفحة مفتوحة: جهازك هو اللي بيدير اللعبة.</p></div>`
@@ -1105,6 +1124,7 @@ function renderLobby(M) {
       $('#aTest').onclick = async () => { const o = $('#aOut'); o.textContent = 'جاري الاختبار...'; try { const r = await llm('Return {"ok":true}'); o.textContent = r && r.ok ? 'شغّال' : 'متصل، بس الرد غريب'; } catch (e) { o.textContent = 'فشل: ' + String(e.message || e).slice(0, 90); } };
     }
     $('#sTimer').onchange = (e) => { HOST.G.settings.timer = +e.target.value; commit(); };
+    $('#sSpot').onchange = (e) => { HOST.G.settings.spot = +e.target.value; commit(); };
     $('#bStart').onclick = () => startGame();
   }
 }
