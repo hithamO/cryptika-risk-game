@@ -499,7 +499,7 @@ const LS = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
-function makeUid() { let u = LS.get('cgrc-uid', null); if (!u) { u = 'u' + Math.random().toString(36).slice(2, 11); LS.set('cgrc-uid', u); } return u; }
+function makeUid() { let u = null; try { u = sessionStorage.getItem('cgrc-uid'); } catch {} if (!u) { u = 'u' + Math.random().toString(36).slice(2, 11); try { sessionStorage.setItem('cgrc-uid', u); } catch {} } return u; }
 const NET = { mode: 'home', status: 'idle', peer: null, conn: null, code: null, conns: new Map(), retry: null, me: { uid: makeUid(), nick: LS.get('cgrc-nick', '') } };
 let PEERS = [];            // [{uid, nick, host}]
 let ST = null;             // latest shared state
@@ -582,8 +582,9 @@ function joinRoom(code) {
     clearTimeout(NET.retry);
     if (NET.conn) { try { NET.conn.close(); } catch {} }
     const conn = NET.peer.connect(PEER_PREFIX + code, { reliable: true }); NET.conn = conn;
-    const guard = setTimeout(() => { if (!conn.open) { NET.status = 'nohost'; render(); NET.retry = setTimeout(connect, 3000); } }, 9000);
-    conn.on('open', () => { clearTimeout(guard); NET.status = 'online'; send(conn, { t: 'hello', uid: myUid(), nick: NET.me.nick }); render(); });
+    const slow = setTimeout(() => { if (!conn.open && NET.conn === conn) { NET.status = 'slow'; render(); } }, 8000);
+    const guard = setTimeout(() => { if (!conn.open && NET.conn === conn) { NET.status = 'nohost'; render(); NET.retry = setTimeout(connect, 2000); } }, 30000);
+    conn.on('open', () => { clearTimeout(guard); clearTimeout(slow); NET.status = 'online'; send(conn, { t: 'hello', uid: myUid(), nick: NET.me.nick }); render(); });
     conn.on('data', clientMsg);
     conn.on('close', () => { if (NET.conn !== conn) return; NET.status = 'lost'; render(); NET.retry = setTimeout(connect, 2500); });
   };
@@ -655,6 +656,8 @@ function newLobby() {
 async function becomeHost(existing) {
   HOST.active = true;
   HOST.G = existing ? clone(existing) : newLobby();
+  const oldHost = HOST.G.host && HOST.G.host.uid;
+  if (oldHost && oldHost !== myUid()) Object.values(HOST.G.seats).forEach((s) => { if (s.uid === oldHost) s.uid = myUid(); });
   HOST.G.host = { uid: myUid() }; HOST.G.code = NET.code;
   HOST.sec = HOST.G.game && HOST.G.game.x ? dec(HOST.G.game.x) : null;
   if (HOST.G.game && HOST.G.game.pending) HOST.G.game.pending = null;   // re-issue the open decision
@@ -677,7 +680,7 @@ function applyWant(uid, want, nick) {
   const G = HOST.G; const cur = Object.keys(G.seats).find((s) => G.seats[s].uid === uid);
   if (!want) { if (cur) { delete G.seats[cur]; return true; } return false; }
   if (!seatOf(want)) return false;
-  if (G.seats[want] && G.seats[want].uid !== uid) return false;
+  if (G.seats[want] && G.seats[want].uid !== uid && online(G.seats[want].uid)) return false;
   if (cur === want) { if (nick && G.seats[want].nick !== nick) { G.seats[want].nick = nick; return true; } return false; }
   if (cur) delete G.seats[cur];
   G.seats[want] = { uid, nick: nick || '' };
@@ -1057,7 +1060,7 @@ function renderHome(M) {
   if ($('#bResume')) $('#bResume').onclick = () => { if (nick()) createRoom(hosting, true); };
 }
 function clientWaiting() {
-  const msg = NET.status === 'nohost' ? `ما لقينا غرفة مفتوحة بالكود <b class="mono">${esc(NET.code)}</b>. تأكد من الكود، أو إنه جهاز الـHost لسا مفتوح. عم نعيد المحاولة...` : `جاري الدخول للغرفة <b class="mono">${esc(NET.code)}</b>...`;
+  const msg = NET.status === 'slow' ? `الشبكة عندك مشددة، عم نوصل للغرفة <b class="mono">${esc(NET.code)}</b> عبر خادم وسيط. ممكن ياخذ لحد 30 ثانية...` : NET.status === 'nohost' ? `ما لقينا غرفة مفتوحة بالكود <b class="mono">${esc(NET.code)}</b>. تأكد من الكود، أو إنه جهاز الـHost لسا مفتوح. عم نعيد المحاولة...` : `جاري الدخول للغرفة <b class="mono">${esc(NET.code)}</b>...`;
   return `<div class="card enter"><div class="wait"><span class="dots"><i></i><i></i><i></i></span><span>${msg}</span></div><div class="bar"><span class="sp"></span><button class="btn btn-line" id="bBack">رجوع</button></div></div>`;
 }
 
@@ -1068,7 +1071,7 @@ function renderLobby(M) {
   M.innerHTML = `<div class="hero ${anim}"><h1 class="title">الطاولة</h1><p>كل واحد يختار مقعد. أي مقعد فاضي بيلعبه الـAI. ${host ? 'لما تكونوا جاهزين، ابدأ اللعبة.' : 'الـHost بيبدأ اللعبة.'}</p></div>
     <div class="lobby"><div>
       ${['grc', 'it', 'ceo'].map((t) => `<div class="seatgrp"><h4>${TEAM[t]}${t === 'ceo' ? ' · بيعرف الخطر ويعطي التلميحات' : t === 'it' ? ' · بيعرفوا الخطر ويعالجوه' : ' · بيحققوا ليكتشفوا الخطر'}</h4><div class="seats">
-        ${SEATS.filter((s) => s.team === t).map((s) => { const o = seats[s.id]; const mine = o && o.uid === myUid(); const taken = o && !mine;
+        ${SEATS.filter((s) => s.team === t).map((s) => { const o = seats[s.id]; const mine = o && o.uid === myUid(); const taken = o && !mine && online(o.uid);
           return `<button class="seat ${mine ? 'mine' : taken ? 'taken' : ''}" data-seat="${s.id}" ${taken && !host ? 'disabled' : ''}><span class="id">${s.id}</span><span class="nm">${esc(s.name)}</span>
           <span class="occ">${o ? `${av(o.uid, o.nick)} ${esc(mine ? 'أنت' : displayName(o.uid, o.nick))}${online(o.uid) ? '' : ' · غير متصل'}` : `${av(null, null, true)} متاح`}</span></button>`; }).join('')}
       </div></div>`).join('')}
